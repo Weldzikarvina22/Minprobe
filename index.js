@@ -1,103 +1,247 @@
-// index.js
 const express = require('express');
-const bodyParser = require('body-parser');
 const cors = require('cors');
-const bcrypt = require('bcryptjs');
+const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
 const mongoose = require('mongoose');
-require('dotenv').config(); // Load environment variables from .env file
-
-// Import User model
-const User = require('./User '); // Ensure there are no trailing spaces
-const { generateReferralCode } = require('./utils'); // Import the function from utils.js
-
+const multer = require('multer');
+const path = require('path');
+const fs = require('fs');
 const app = express();
+
+require('dotenv').config();
+
+// Import User Model and Utility Functions
+const User = require('./models/User');
+const { generateReferralCode } = require('./utils');
 const PORT = process.env.PORT || 3000;
+const SECRET_KEY = process.env.SECRET_KEY || 'defaultsecretkey';
+
+// Ensure Uploads Directory Exists
+const uploadsDir = path.join(__dirname, 'uploads/profiles');
+if (!fs.existsSync(uploadsDir)) {
+    fs.mkdirSync(uploadsDir, { recursive: true });
+}
+
+// Multer Setup
+const storage = multer.diskStorage({
+    destination: (req, file, cb) => {
+        cb(null, uploadsDir); // Save files in 'uploads/profiles'
+    },
+    filename: (req, file, cb) => {
+        const uniqueName = `${Date.now()}-${file.originalname.trim()}`;
+        cb(null, uniqueName); // Unique filename
+    },
+});
+
+const fileFilter = (req, file, cb) => {
+    if (file.mimetype.startsWith('image/')) {
+        cb(null, true); // Accept only image files
+    } else {
+        cb(new Error('Invalid file type. Only image files are allowed.'), false);
+    }
+};
+
+const upload = multer({ storage, fileFilter });
 
 // Middleware
 app.use(cors());
-app.use(bodyParser.json());
+app.use(express.json());
+app.use('/uploads', express.static(path.join(__dirname, 'uploads'))); // Serve uploads folder publicly
 
-// MongoDB connection
-mongoose.connect(process.env.MONGODB_URI, {
-    useNewUrlParser: true,
-    useUnifiedTopology: true
-})
-    .then(() => console.log('Connected to MongoDB'))
-    .catch(err => console.error('Could not connect to MongoDB:', err));
+// MongoDB Connection
+mongoose
+    .connect(process.env.MONGODB_URI, { useNewUrlParser: true, useUnifiedTopology: true })
+    .then(() => console.log('Connected to MongoDB successfully.'))
+    .catch((err) => console.error('Failed to connect to MongoDB:', err));
+
+// Authenticate JWT Middleware
+const authenticateToken = async (req, res, next) => {
+    const token = req.header('Authorization')?.replace('Bearer ', '');
+
+    if (!token) {
+        return res.status(401).json({ success: false, message: 'Authorization token missing.' });
+    }
+
+    try {
+        const decoded = jwt.verify(token, SECRET_KEY); // Use SECRET_KEY
+        const user = await User.findById(decoded.id);
+
+        if (!user) {
+            return res.status(404).json({ success: false, message: 'User not found.' });
+        }
+
+        req.user = { id: user.id, role: user.role }; // Attach user to request
+        next();
+    } catch (error) {
+        console.error('Authentication error:', error);
+        res.status(401).json({ success: false, message: 'Invalid token.' });
+    }
+};
+
+// Routes
 
 // User Registration
 app.post('/register', async (req, res) => {
-    const { username, password, role, referrer } = req.body;
+    const { username, email, password, role, referralCode } = req.body;
 
-    if (!username || !password || !role) {
-        return res.status(400).send('Username, password, and role are required.');
+    if (!username || !email || !password || !role) {
+        return res.status(400).json({ success: false, message: 'All fields are required.' });
     }
 
-    const hashedPassword = await bcrypt.hash(password, 10);
-    const referralCode = generateReferralCode(); // Generate a referral code
-    const newUser  = new User({ username, password: hashedPassword, role, referralCode });
-
     try {
-        // Check if the referrer exists
-        if (referrer) {
-            const referrerUser  = await User.findOne({ username: referrer });
-            if (referrerUser ) {
-                newUser .referrer = referrer; // Set the referrer
-                referrerUser .points = (referrerUser .points || 0) + 10000; // Reward the referrer with points
-                await referrerUser .save(); // Save the referrer user
-            } else {
-                return res.status(400).send('Referrer does not exist.');
+        const hashedPassword = await bcrypt.hash(password, 10);
+
+        let referrerUser = null;
+
+        if (referralCode && typeof referralCode === 'string') {
+            if (role === 'admin') {
+                return res.status(403).json({ success: false, message: 'Admins cannot use referral codes.' });
             }
+
+            // Validate referral code
+            referrerUser = await User.findOne({ referralCode });
+            if (!referrerUser) {
+                return res.status(400).json({ success: false, message: 'Invalid referral code.' });
+            }
+
+            // Award points to the referrer
+            referrerUser.points = (referrerUser.points || 0) + 10000; // Add 10,000 points
+            await referrerUser.save();
         }
 
-        await newUser .save();
-        res.status(201).send(`User  registered successfully with referral code: ${referralCode}`);
+        let generatedReferralCode = null;
+
+        if (role === 'admin') {
+            generatedReferralCode = generateReferralCode();
+        }
+
+        const newUser = new User({
+            username,
+            email,
+            password: hashedPassword,
+            role,
+            referralCode: generatedReferralCode,
+            referrer: referrerUser ? referralCode : null,
+        });
+
+        await newUser.save();
+
+        res.status(201).json({ success: true, message: 'User registered successfully.', referralCode: generatedReferralCode });
     } catch (error) {
-        res.status(400).send('Error registering user: ' + error.message);
+        console.error('Error during registration:', error);
+        res.status(500).json({ success: false, message: 'Error during registration.', error: error.message });
     }
 });
 
 // User Login
 app.post('/login', async (req, res) => {
     const { username, password } = req.body;
-    const user = await User.findOne({ username });
 
-    if (!user || !(await bcrypt.compare(password, user.password))) {
-        return res.status(401).send('Invalid credentials.');
+    try {
+        const user = await User.findOne({ username });
+
+        if (!user || !(await bcrypt.compare(password, user.password))) {
+            console.log('Invalid login attempt:', username);
+            return res.status(401).json({ success: false, message: 'Invalid username or password.' });
+        }
+
+        const token = jwt.sign({ id: user._id, username: user.username }, SECRET_KEY, { expiresIn: '1h' });
+
+        res.json({ success: true, message: 'Login successful.', token, user: {id: user._id,
+                username: user.username,
+                email: user.email,
+                photoUrl: user.photo ? `http://localhost:${PORT}${user.photo}` : null, // Attach photo URL
+            }
+         });
+    } catch (error) {
+        console.error('Error during login:', error);
+        res.status(500).json({ success: false, message: 'Internal server error.' });
     }
+});
+app.get('/profile', authenticateToken, async (req, res) => {
+    try {
+        const user = await User.findById(req.user.id);
 
-    const token = jwt.sign({ username: user.username, role: user.role }, process.env.SECRET_KEY);
-    res.json({ token });
+        if (!user) {
+            return res.status(404).json({ success: false, message: 'User not found.' });
+        }
+
+        res.json({
+            success: true,
+            message: 'Profile fetched successfully.',
+            user: {
+                id: user._id,
+                username: user.username,
+                email: user.email,
+                role: user.role,
+                points: user.points,
+                photoUrl: user.photo ? `http://localhost:${PORT}${user.photo}` : null // Attach full photo URL
+            },
+        });
+    } catch (error) {
+        console.error('Error fetching profile:', error);
+        res.status(500).json({ success: false, message: 'An error occurred.', error: error.message });
+    }
 });
 
-// Middleware to authenticate token
-const authenticateToken = (req, res, next) => {
-    const token = req.headers['authorization']?.split(' ')[1];
-    if (!token) return res.sendStatus(401);
+// Change Password
+app.post('/profile/change-password', authenticateToken, async (req, res) => {
+    const { currentPassword, newPassword } = req.body;
 
-    jwt.verify(token, process.env.SECRET_KEY, (err, user) => {
-        if (err) return res.sendStatus(403);
-        req.user = user;
-        next();
-    });
-};
+    try {
+        const user = await User.findById(req.user.id);
 
-// Protected Route: Admin Area
+        if (!user) {
+            return res.status(404).json({ success: false, message: 'User not found.' });
+        }
+
+        if (!(await bcrypt.compare(currentPassword, user.password))) {
+            return res.status(400).json({ success: false, message: 'Incorrect current password.' });
+        }
+
+        user.password = await bcrypt.hash(newPassword, 10);
+        await user.save();
+
+        res.json({ success: true, message: 'Password updated successfully.' });
+    } catch (error) {
+        console.error('Error updating password:', error);
+        res.status(500).json({ success: false, message: 'An error occurred.', error: error.message });
+    }
+});
+
+// Upload Profile Photo
+app.post('/profile/upload-photo', authenticateToken, upload.single('photo'), async (req, res) => {
+    try {
+        const user = await User.findById(req.user.id);
+
+        if (!user) {
+            return res.status(404).json({ success: false, message: 'User not found.' });
+        }
+
+        const photoUrl = `/uploads/profiles/${req.file.filename}`;
+        user.photo = photoUrl;
+        await user.save();
+
+        res.json({
+            success: true,
+            message: 'Profile photo uploaded successfully.',
+            photoUrl: `http://localhost:${PORT}${photoUrl}`, // Construct full URL
+        });
+    } catch (error) {
+        console.error('Error uploading photo:', error);
+        res.status(500).json({ success: false, message: 'An error occurred.', error: error.message });
+    }
+});
+
+// Protected Admin Route
 app.get('/admin', authenticateToken, (req, res) => {
     if (req.user.role !== 'admin') {
         return res.sendStatus(403); // Forbidden
     }
-    res.send('Welcome to the admin area.');
+    res.json({ success: true, message: 'Welcome to the admin area.' });
 });
 
-// Protected Route: Referrals
-app.get('/referrals', authenticateToken, async (req, res) => {
-    const referrals = await User.find({ referrer: req.user.username });
-    res.json(referrals);
-});
-
-// Start the server
+// Start Server
 app.listen(PORT, () => {
-    console.log(`Server is running on http://localhost:${PORT}`);
+    console.log(`Server running at http://localhost:${PORT}`);
 });
